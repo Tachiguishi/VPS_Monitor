@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import Icon from './Icon.vue'
 import TrendChart from './TrendChart.vue'
 import {
@@ -8,18 +8,18 @@ import {
 } from './format'
 
 const overview = ref(null)
-const history = ref(null)
+const history = shallowRef(null)
+const trend = shallowRef(null)
 const selected = ref('all')
 const range = ref('24h')
 const metric = ref(metrics[0])
 const page = ref(1)
 const activeSection = ref(location.hash === '#history' ? 'history' : 'overview')
 const overviewError = ref('')
-const historyError = ref('')
+const historyError = ref(null)
 const notice = ref('')
 const refreshing = ref(false)
-const historyBusy = ref(false)
-const overviewBusy = ref(false)
+const historyPending = ref(null)
 const ranges = [
   { key: '24h', label: '24 小时' },
   { key: '7d', label: '7 天' },
@@ -27,12 +27,12 @@ const ranges = [
 ]
 const abortOnUnmount = new AbortController()
 let historyRequest
+let overviewRequest
 let timer
 
 const servers = computed(() => (overview.value?.servers || []).map((server, i) => ({
   ...server, colorIndex: i, sample: server.lastSuccess || server.latest,
 })))
-const chosenServers = computed(() => servers.value.filter(s => selected.value === 'all' || s.id === selected.value))
 const names = computed(() => Object.fromEntries(servers.value.map(s => [s.id, s.name])))
 const summary = computed(() => {
   const all = servers.value
@@ -50,6 +50,9 @@ const summary = computed(() => {
   ]
 })
 const pageCount = computed(() => Math.max(1, Math.ceil((history.value?.total ?? 0) / 10)))
+const historyBusy = computed(() => historyPending.value !== null)
+const paginationDisabled = computed(() => historyBusy.value ||
+  trend.value?.server !== selected.value || trend.value?.range !== range.value)
 const intervalLabel = computed(() => {
   const seconds = overview.value?.pollIntervalSeconds
   if (!seconds) return '—'
@@ -68,42 +71,57 @@ async function request(url, options) {
   return response.json()
 }
 
-async function loadOverview() {
-  if (overviewBusy.value) return false
-  overviewBusy.value = true
-  try {
-    const previous = overview.value?.updatedAt
-    overview.value = await request('/api/overview')
-    overviewError.value = ''
-    return previous !== overview.value.updatedAt
-  } catch (error) {
-    if (!abortOnUnmount.signal.aborted) overviewError.value = error.message
-    return false
-  } finally {
-    overviewBusy.value = false
-  }
+function loadOverview() {
+  if (overviewRequest) return overviewRequest
+  overviewRequest = request('/api/overview')
+    .then(data => {
+      const updated = overview.value?.updatedAt !== data.updatedAt
+      overview.value = data
+      overviewError.value = ''
+      return updated
+    })
+    .catch(error => {
+      if (!abortOnUnmount.signal.aborted) overviewError.value = error.message
+      return false
+    })
+    .finally(() => { overviewRequest = undefined })
+  return overviewRequest
 }
 
-async function loadHistory() {
+async function loadHistory(updateTrend = true) {
+  if (abortOnUnmount.signal.aborted) return
   historyRequest?.abort()
   const controller = new AbortController()
   historyRequest = controller
-  historyBusy.value = true
-  historyError.value = ''
-  const query = new URLSearchParams({ server: selected.value, range: range.value, page: page.value })
+  const server = selected.value
+  const timeRange = range.value
+  const target = updateTrend || trend.value?.server !== server || trend.value?.range !== timeRange ? 'trend' : 'records'
+  historyPending.value = target
+  historyError.value = null
+  const query = new URLSearchParams({ server, range: timeRange, page: page.value })
   try {
-    history.value = await request('/api/history?' + query, { signal: controller.signal })
+    const data = await request('/api/history?' + query, { signal: controller.signal })
+    if (controller.signal.aborted) return
+    history.value = data
+    if (target === 'trend') {
+      trend.value = {
+        data, server, range: timeRange,
+        servers: servers.value
+          .filter(s => server === 'all' || s.id === server)
+          .map(({ id, name, colorIndex }) => ({ id, name, colorIndex })),
+      }
+    }
   } catch (error) {
-    if (!controller.signal.aborted) historyError.value = error.message
+    if (!controller.signal.aborted) historyError.value = { target, message: error.message }
   } finally {
-    if (historyRequest === controller) historyBusy.value = false
+    if (historyRequest === controller) historyPending.value = null
   }
 }
 
 async function sync() {
   if (refreshing.value) return
   const updated = await loadOverview()
-  if (overview.value && page.value === 1 && !historyBusy.value && (updated || !history.value || historyError.value)) {
+  if (overview.value && page.value === 1 && !historyBusy.value && (updated || !history.value || historyError.value?.target === 'trend')) {
     await loadHistory()
   }
 }
@@ -113,12 +131,9 @@ async function refresh() {
   notice.value = ''
   try {
     await request('/api/refresh', { method: 'POST', headers: { 'X-Monitor-Refresh': '1' } })
+    await overviewRequest
     await loadOverview()
-    if (page.value !== 1) {
-      page.value = 1
-    } else {
-      await loadHistory()
-    }
+    await loadHistory()
   } catch (error) {
     if (!abortOnUnmount.signal.aborted) {
       notice.value = error.retryAfter ? `请在 ${error.retryAfter} 秒后重新采集。` : error.message
@@ -139,6 +154,14 @@ function setRange(key) {
   page.value = 1
 }
 
+function changePage(next) {
+  if (page.value === next) {
+    loadHistory(false)
+  } else {
+    page.value = next
+  }
+}
+
 function syncSection() {
   activeSection.value = location.hash === '#history' ? 'history' : 'overview'
 }
@@ -152,8 +175,7 @@ function displayUsage(sample) {
 }
 
 watch([selected, range, page], ([server, timeRange], [oldServer, oldRange]) => {
-  if (server !== oldServer || timeRange !== oldRange) history.value = null
-  loadHistory()
+  loadHistory(server !== oldServer || timeRange !== oldRange)
 })
 onMounted(async () => {
   window.addEventListener('hashchange', syncSection)
@@ -217,9 +239,9 @@ onBeforeUnmount(() => {
           <span class="breadcrumb">监控中心</span>
           <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
             <span v-if="overview?.demo" class="demo-pill"><span></span>演示模式</span>
-            <span v-if="overview?.updatedAt" class="top-timestamp">
+            <span v-if="overview" class="top-timestamp">
               <Icon name="clock" :size="15" />
-              <span>最后采样 <time class="font-mono text-soft" :datetime="overview.updatedAt">{{ formatTime(overview.updatedAt, 'clock') }}</time></span>
+              <span>最后采样 <time v-if="overview.updatedAt" class="font-mono text-soft" :datetime="overview.updatedAt">{{ formatTime(overview.updatedAt, 'clock') }}</time><span v-else>—</span></span>
             </span>
           </div>
         </div>
@@ -230,9 +252,9 @@ onBeforeUnmount(() => {
           <div>
             <h1>服务器监控</h1>
             <p class="mt-2 text-muted">查看 VPS 运行状态、资源用量和历史采样。</p>
-            <p v-if="overview?.updatedAt" class="mobile-timestamp">
+            <p v-if="overview" class="mobile-timestamp">
               <Icon name="clock" :size="15" />
-              <span>最后采样 <time class="font-mono text-soft" :datetime="overview.updatedAt">{{ formatTime(overview.updatedAt, 'clock') }}</time></span>
+              <span>最后采样 <time v-if="overview.updatedAt" class="font-mono text-soft" :datetime="overview.updatedAt">{{ formatTime(overview.updatedAt, 'clock') }}</time><span v-else>—</span></span>
             </p>
           </div>
           <button type="button" class="primary-button" :disabled="refreshing || !overview" @click="refresh">
@@ -241,11 +263,22 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <p v-if="overviewError" class="message error-message" role="alert">{{ overviewError }}</p>
-        <p v-if="notice" class="message" role="status">{{ notice }}</p>
-        <p v-if="!overview && !overviewError" class="message" role="status">正在读取监控数据…</p>
+        <template v-if="!overview">
+          <p v-if="overviewError" class="message error-message" role="alert">{{ overviewError }}</p>
+          <p v-else class="message" role="status">正在读取监控数据…</p>
+        </template>
 
         <template v-if="overview">
+          <div v-if="overviewError || notice" class="dashboard-notices">
+            <div v-if="overviewError" class="message error-message">
+              <span role="alert">{{ overviewError }}</span>
+              <button type="button" class="detail-link" aria-label="关闭状态读取提示" @click="overviewError = ''">关闭</button>
+            </div>
+            <div v-if="notice" class="message">
+              <span role="status">{{ notice }}</span>
+              <button type="button" class="detail-link" aria-label="关闭采集提示" @click="notice = ''">关闭</button>
+            </div>
+          </div>
           <div class="stats-grid" aria-label="监控摘要">
             <article v-for="stat in summary" :key="stat.label" class="panel stat">
               <div class="flex items-center gap-2.5">
@@ -326,7 +359,7 @@ onBeforeUnmount(() => {
                 <Icon name="chevron" :size="16" />
               </label>
             </div>
-            <div class="panel chart-panel" :aria-busy="historyBusy">
+            <div class="panel chart-panel">
               <div class="chart-controls">
                 <div class="segments" role="group" aria-label="监控指标">
                   <button v-for="item in metrics" :key="item.key" type="button" :aria-pressed="metric.key === item.key" @click="metric = item">{{ item.label }}</button>
@@ -335,18 +368,23 @@ onBeforeUnmount(() => {
                   <button v-for="item in ranges" :key="item.key" type="button" :aria-pressed="range === item.key" @click="setRange(item.key)">{{ item.label }}</button>
                 </div>
               </div>
-              <p v-if="historyError" class="message error-message" role="alert">{{ historyError }}
-                <button type="button" class="detail-link ml-2" @click="loadHistory">重试</button>
-              </p>
-              <div v-else-if="!history && historyBusy" class="chart-empty" role="status">正在读取采样记录…</div>
-              <TrendChart v-else :history="history" :servers="chosenServers" :metric="metric" :range="range" />
+              <div class="history-feedback">
+                <template v-if="historyError?.target === 'trend'">
+                  <span role="alert">{{ historyError.message }}<template v-if="history"> · 显示上次结果</template></span>
+                  <button type="button" class="detail-link" @click="loadHistory()">重试</button>
+                </template>
+                <span v-else role="status">{{ historyPending === 'trend' ? (history ? '正在更新，暂显示上次结果' : '正在读取采样记录…') : '' }}</span>
+              </div>
+              <div :aria-busy="historyPending === 'trend'">
+                <TrendChart :history="trend?.data" :servers="trend?.servers" :metric="metric" :range="trend?.range" />
+              </div>
             </div>
 
             <div class="section-heading records-heading">
               <h2 id="records-heading">采样记录</h2>
               <span v-if="history" class="text-sm text-muted">共 {{ formatCount(history.total) }} 条</span>
             </div>
-            <div class="panel records-panel">
+            <div class="panel records-panel" :aria-busy="historyBusy">
               <div v-if="history?.records.length" class="table-scroll" tabindex="0" role="region" aria-labelledby="records-heading">
                 <table>
                   <thead>
@@ -374,10 +412,17 @@ onBeforeUnmount(() => {
               </div>
               <p v-else class="p-5 text-sm text-muted">{{ historyBusy ? '正在读取采样记录…' : historyError ? '采样记录暂不可用' : '该时段暂无采样记录' }}</p>
               <div v-if="history?.total > 10" class="pagination">
-                <span class="text-sm text-muted">第 {{ history.page }} / {{ pageCount }} 页</span>
+                <div class="flex items-baseline gap-2">
+                  <span role="status" class="text-sm" :class="historyError?.target === 'records' ? 'text-rose-200' : 'text-muted'">
+                    <span v-if="historyPending === 'records'" aria-hidden="true">正在翻页…</span>
+                    <template v-else-if="historyError?.target === 'records'">翻页失败</template>
+                    <template v-else>第 {{ history.page }} / {{ pageCount }} 页</template>
+                  </span>
+                  <button v-if="historyError?.target === 'records'" type="button" @click="loadHistory(false)">重试</button>
+                </div>
                 <div class="flex gap-2">
-                  <button type="button" :disabled="history.page <= 1 || historyBusy" @click="page = history.page - 1">上一页</button>
-                  <button type="button" :disabled="history.page >= pageCount || historyBusy" @click="page = history.page + 1">下一页</button>
+                  <button type="button" :disabled="history.page <= 1 || paginationDisabled" @click="changePage(history.page - 1)">上一页</button>
+                  <button type="button" :disabled="history.page >= pageCount || paginationDisabled" @click="changePage(history.page + 1)">下一页</button>
                 </div>
               </div>
             </div>

@@ -1,11 +1,11 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { formatLoad, formatPercent, formatTime } from './format'
 import Icon from './Icon.vue'
 
 const props = defineProps({
   history: Object,
-  servers: { type: Array, required: true },
+  servers: { type: Array, default: () => [] },
   metric: { type: Object, required: true },
   range: String,
 })
@@ -13,8 +13,8 @@ const panel = useTemplateRef('panel')
 const chart = useTemplateRef('chart')
 const tooltip = ref(null)
 const colors = ['#a78bfa', '#5adac1', '#f5b67d', '#81aaff', '#f9a8ce']
-const count = computed(() => props.servers.reduce((total, server) =>
-  total + (props.history?.series?.[server.id] || []).filter(p => p[props.metric.key] != null).length, 0))
+const hasPoints = computed(() => props.servers.some(server =>
+  seriesFor(server).some(point => point[props.metric.key] != null)))
 const shortTime = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
 const shortDate = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric' })
 let observer
@@ -41,11 +41,14 @@ function draw() {
   if (!width || !height) return
 
   const dpr = window.devicePixelRatio || 1
-  canvas.width = Math.round(width * dpr)
-  canvas.height = Math.round(height * dpr)
+  const pixelWidth = Math.round(width * dpr)
+  const pixelHeight = Math.round(height * dpr)
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight
   const ctx = canvas.getContext('2d')
   if (!ctx) return
-  ctx.scale(canvas.width / width, canvas.height / height)
+  ctx.setTransform(pixelWidth / width, 0, 0, pixelHeight / height, 0, 0)
+  ctx.clearRect(0, 0, width, height)
 
   const { metric, history } = props
   const start = Date.parse(history.from)
@@ -194,21 +197,21 @@ onBeforeUnmount(() => {
   observer?.disconnect()
   cancelAnimationFrame(frame)
 })
-watch(() => [props.history, props.metric, props.servers, props.range], async () => {
+watch(() => [props.history, props.metric, props.servers, props.range], () => {
+  geometry = null
   tooltip.value = null
-  await nextTick()
   scheduleDraw()
-})
+}, { flush: 'post' })
 </script>
 
 <template>
   <div ref="panel" class="chart-wrap">
-    <canvas v-if="count" ref="chart" class="trend-canvas" role="img"
+    <canvas v-show="hasPoints" ref="chart" class="trend-canvas" role="img"
       :aria-label="`${metric.label}随时间变化的趋势图，采样数值可在下方的采样记录中查看`"
       @pointermove="showTooltip" @pointerleave="tooltip = null"></canvas>
-    <div v-else class="chart-empty">
+    <div v-if="!hasPoints" class="chart-empty">
       <Icon name="trend" :size="32" />
-      <span>该时段暂无{{ metric.label }}数据</span>
+      <span v-if="history">该时段暂无{{ metric.label }}数据</span>
     </div>
     <template v-if="tooltip">
       <span class="chart-cursor" aria-hidden="true" :style="{ left: tooltip.x + 'px' }"></span>
