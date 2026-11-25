@@ -1,0 +1,6 @@
+/config.json
+/.env
+/data/
+/bin/
+/web/dist/
+/web/node_modules/
